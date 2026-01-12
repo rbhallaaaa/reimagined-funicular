@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vienna Blaster</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            overflow: hidden;
+            background: #000;
+            font-family: 'Courier New', monospace;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        // ============================================================================
+        // CONSTANTS
+        // ============================================================================
+        // Levels: each level is an array of words that must be hit in order
+        const LEVELS = [
+            // Level 1: Piano Man
+            ["And", "the", "waitress", "is", "practicing", "politics", "As", "the", "businessmen", "slowly", "get", "stoned", "Yes,", "they're", "sharing", "a", "drink", "they", "call", "loneliness", "But", "it's", "better", "than", "drinkin'", "alone"],
+            // Level 2: Vienna
+            ["Where's", "the", "fire,", "what's", "the", "hurry", "about?", "You'd", "better", "cool", "it", "off", "before", "you", "burn", "it", "out", "You've", "got", "so", "much", "to", "do", "And", "only", "so", "many", "hours", "in", "a", "day"]
+        ];
+
+        // Game constants
+        const PLAYER_SPEED = 300; // pixels per second
+        const BULLET_SPEED = 500; // pixels per second
+        const TARGET_BASE_SPEED = 105; // pixels per second (slightly slower)
+        const TARGET_HORIZONTAL_DRIFT = 170; // pixels per second (stronger sideways drift for chaotic diagonals)
+        const INITIAL_SPAWN_INTERVAL = 1100; // milliseconds (faster spawning)
+        const MIN_SPAWN_INTERVAL = 450; // milliseconds
+        const SPAWN_INTERVAL_DECREASE_RATE = 0.2; // per second (faster ramp)
+        const TARGET_SPEED_INCREASE_RATE = 0.7; // per second (slower ramp)
+        const TARGET_DIRECTION_CHANGE_INTERVAL = 0.25; // seconds (how often targets change horizontal direction)
+        const INITIAL_LIVES = 5;
+        const COMBO_TIMEOUT = 2000; // milliseconds
+        const SCREEN_SHAKE_DURATION = 350; // milliseconds (increased for more violent effect)
+        const SCREEN_SHAKE_INTENSITY = 10; // pixels (increased for more violent effect)
+        const PARTICLE_COUNT = 30; // increased for more violent blast
+        const PARTICLE_LIFETIME = 900; // milliseconds
+        const PARTICLE_SIZE_MIN = 3;
+        const PARTICLE_SIZE_MAX = 8;
+        const RING_LIFETIME = 400; // milliseconds
+        const RING_MAX_RADIUS = 60; // increased for bigger explosion
+        const NEXT_WORD_SPAWN_THRESHOLD = 0.3; // spawn next word when current is ~30% down screen for heavier overlap
+
+        // Visual constants
+        const PLAYER_WIDTH = 30;
+        const PLAYER_HEIGHT = 20;
+        const BULLET_WIDTH = 4;
+        const BULLET_HEIGHT = 10;
+        const TARGET_PADDING = 10;
+        const STAR_COUNT = 50;
+        const STAR_SPEED = 30; // pixels per second
+
+        // Fonts
+        const HUD_FONT = "16px 'Courier New', monospace";
+        const TARGET_FONT = "14px 'Courier New', monospace";
+        const GAME_OVER_FONT = "48px 'Courier New', monospace";
+        const INSTRUCTION_FONT = "12px 'Courier New', monospace";
+
+        // Colors
+        const COLOR_BACKGROUND = "#0a0a0a";
+        const COLOR_STAR = "#ffffff";
+        const COLOR_PLAYER = "#00ff00";
+        const COLOR_BULLET = "#ffff00";
+        const COLOR_TARGET = "#ff6b6b";
+        const COLOR_HUD = "#ffffff";
+        const COLOR_PARTICLE = "#ffaa00";
+
+        // ============================================================================
+        // GAME STATE
+        // ============================================================================
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        let gameState = {
+            player: { x: 0, y: 0 },
+            bullets: [],
+            targets: [],
+            particles: [],
+            stars: [],
+            score: 0,
+            lives: INITIAL_LIVES,
+            combo: 1,
+            lastHitTime: 0,
+            lastSpawnTime: 0,
+            spawnInterval: INITIAL_SPAWN_INTERVAL, // base interval from difficulty curve
+            spawnJitterInterval: INITIAL_SPAWN_INTERVAL, // actual randomized interval used
+            targetSpeed: TARGET_BASE_SPEED,
+            gameTime: 0,
+            screenShake: { x: 0, y: 0, time: 0 },
+            isGameOver: false,
+            keys: {},
+            mouseDown: false,
+            currentLevel: 0,
+            currentWordIndex: 0,
+            isLevelComplete: false,
+            isGameWon: false,
+            levelCompleteTime: 0
+        };
+
+        // ============================================================================
+        // INITIALIZATION
+        // ============================================================================
+        function initStars() {
+            gameState.stars = [];
+            for (let i = 0; i < STAR_COUNT; i++) {
+                gameState.stars.push({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    speed: STAR_SPEED + Math.random() * 20
+                });
+            }
+        }
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gameState.player.x = canvas.width / 2;
+            gameState.player.y = canvas.height - 40;
+            initStars();
+        }
+
+        function resetGame(levelIndex) {
+            // Decide which level to start from:
+            // - if a valid levelIndex is passed, use that
+            // - otherwise, restart current level, or default to 0
+            let targetLevel = gameState.currentLevel || 0;
+            if (typeof levelIndex === 'number' && levelIndex >= 0 && levelIndex < LEVELS.length) {
+                targetLevel = levelIndex;
+            }
+
+            gameState.player.x = canvas.width / 2;
+            gameState.player.y = canvas.height - 40;
+            gameState.bullets = [];
+            gameState.targets = [];
+            gameState.particles = [];
+            gameState.score = 0;
+            gameState.lives = INITIAL_LIVES;
+            gameState.combo = 1;
+            gameState.lastHitTime = 0;
+            gameState.lastSpawnTime = 0;
+            gameState.spawnInterval = INITIAL_SPAWN_INTERVAL;
+            gameState.spawnJitterInterval = INITIAL_SPAWN_INTERVAL;
+            gameState.targetSpeed = TARGET_BASE_SPEED;
+            gameState.gameTime = 0;
+            gameState.screenShake = { x: 0, y: 0, time: 0 };
+            gameState.isGameOver = false;
+            gameState.currentLevel = targetLevel;
+            gameState.currentWordIndex = 0;
+            gameState.isLevelComplete = false;
+            gameState.isGameWon = false;
+            gameState.levelCompleteTime = 0;
+            initStars();
+        }
+
+        // ============================================================================
+        // SPAWNING
+        // ============================================================================
+        function spawnTarget() {
+            // Only spawn if level is not complete and we haven't won
+            if (gameState.isLevelComplete || gameState.isGameWon) return;
+            
+            // Get current level words
+            const levelWords = LEVELS[gameState.currentLevel];
+            if (!levelWords || gameState.currentWordIndex >= levelWords.length) return;
+            
+            // Check if current word block exists
+            const currentWordExists = gameState.targets.some(
+                target => target.wordIndex === gameState.currentWordIndex
+            );
+            
+            // Spawn current word if it doesn't exist
+            if (!currentWordExists) {
+                const targetWord = levelWords[gameState.currentWordIndex];
+                ctx.font = TARGET_FONT;
+                const textWidth = ctx.measureText(targetWord).width;
+                const targetWidth = textWidth + TARGET_PADDING * 2;
+                const targetHeight = 30;
+                
+                gameState.targets.push({
+                    x: Math.random() * (canvas.width - targetWidth),
+                    y: -targetHeight,
+                    width: targetWidth,
+                    height: targetHeight,
+                    text: targetWord,
+                    wordIndex: gameState.currentWordIndex,
+                    vx: (Math.random() - 0.5) * TARGET_HORIZONTAL_DRIFT,
+                    vy: gameState.targetSpeed,
+                    directionChangeTimer: Math.random() * TARGET_DIRECTION_CHANGE_INTERVAL,
+                    swayTime: Math.random() * Math.PI * 2,
+                    swaySpeed: 1.5 + Math.random() * 1.5, // faster sway, 1.5–3 rad/s
+                    swayAmp: 40 + Math.random() * 40 // larger lateral sway, 40–80px
+                });
+            }
+            
+            // Check if current word is near bottom - if so, spawn next word for overlap
+            const currentWordTarget = gameState.targets.find(
+                target => target.wordIndex === gameState.currentWordIndex
+            );
+            
+            if (currentWordTarget && gameState.currentWordIndex + 1 < levelWords.length) {
+                const currentWordProgress = currentWordTarget.y / canvas.height;
+                
+                // If current word is past threshold, spawn next word
+                if (currentWordProgress > NEXT_WORD_SPAWN_THRESHOLD) {
+                    const nextWordIndex = gameState.currentWordIndex + 1;
+                    const nextWordExists = gameState.targets.some(
+                        target => target.wordIndex === nextWordIndex
+                    );
+                    
+                    // Spawn next word if it doesn't exist yet
+                    if (!nextWordExists) {
+                        const nextWord = levelWords[nextWordIndex];
+                        ctx.font = TARGET_FONT;
+                        const textWidth = ctx.measureText(nextWord).width;
+                        const targetWidth = textWidth + TARGET_PADDING * 2;
+                        const targetHeight = 30;
+                        
+                        gameState.targets.push({
+                            x: Math.random() * (canvas.width - targetWidth),
+                            y: -targetHeight,
+                            width: targetWidth,
+                            height: targetHeight,
+                            text: nextWord,
+                            wordIndex: nextWordIndex,
+                            vx: (Math.random() - 0.5) * TARGET_HORIZONTAL_DRIFT,
+                            vy: gameState.targetSpeed,
+                            directionChangeTimer: Math.random() * TARGET_DIRECTION_CHANGE_INTERVAL,
+                            swayTime: Math.random() * Math.PI * 2,
+                            swaySpeed: 1.5 + Math.random() * 1.5,
+                            swayAmp: 40 + Math.random() * 40
+                        });
+                    }
+                }
+            }
+        }
+
+        function createParticleBurst(x, y) {
+            // More violent blast - multiple layers of particles
+            // Fast outer particles
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const speed = 150 + Math.random() * 180; // faster particles
+                const size = PARTICLE_SIZE_MIN + Math.random() * (PARTICLE_SIZE_MAX - PARTICLE_SIZE_MIN);
+                gameState.particles.push({
+                    type: 'spark',
+                    x,
+                    y,
+                    vx: Math.cos(angle) * speed,
+                    vy: Math.sin(angle) * speed,
+                    life: PARTICLE_LIFETIME,
+                    maxLife: PARTICLE_LIFETIME,
+                    size
+                });
+            }
+            // Slow inner particles for depth
+            for (let i = 0; i < 10; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const speed = 50 + Math.random() * 80;
+                const size = PARTICLE_SIZE_MIN + Math.random() * (PARTICLE_SIZE_MAX - PARTICLE_SIZE_MIN);
+                gameState.particles.push({
+                    type: 'spark',
+                    x,
+                    y,
+                    vx: Math.cos(angle) * speed,
+                    vy: Math.sin(angle) * speed,
+                    life: PARTICLE_LIFETIME * 1.2,
+                    maxLife: PARTICLE_LIFETIME * 1.2,
+                    size
+                });
+            }
+            // Multiple shockwave rings for more violent effect (nested rings)
+            gameState.particles.push({
+                type: 'ring',
+                x,
+                y,
+                vx: 0,
+                vy: 0,
+                life: RING_LIFETIME,
+                maxLife: RING_LIFETIME,
+                radius: 5
+            });
+            // Second inner ring for layered explosion effect
+            gameState.particles.push({
+                type: 'ring',
+                x,
+                y,
+                vx: 0,
+                vy: 0,
+                life: RING_LIFETIME * 0.7,
+                maxLife: RING_LIFETIME * 0.7,
+                radius: 8 // starts larger for nested effect
+            });
+        }
+
+        // ============================================================================
+        // INPUT HANDLING
+        // ============================================================================
+        function handleInput(dt) {
+            // Player movement (horizontal only)
+            let moveX = 0;
+            if (gameState.keys['a'] || gameState.keys['A'] || gameState.keys['ArrowLeft']) {
+                moveX -= 1;
+            }
+            if (gameState.keys['d'] || gameState.keys['D'] || gameState.keys['ArrowRight']) {
+                moveX += 1;
+            }
+            
+            gameState.player.x += moveX * PLAYER_SPEED * dt;
+            gameState.player.x = Math.max(PLAYER_WIDTH / 2, Math.min(canvas.width - PLAYER_WIDTH / 2, gameState.player.x));
+
+            // Shooting
+            if (gameState.keys[' '] || gameState.mouseDown) {
+                const now = Date.now();
+                if (!gameState.lastShotTime || now - gameState.lastShotTime > 150) {
+                    gameState.bullets.push({
+                        x: gameState.player.x,
+                        y: gameState.player.y - PLAYER_HEIGHT / 2,
+                        width: BULLET_WIDTH,
+                        height: BULLET_HEIGHT
+                    });
+                    gameState.lastShotTime = now;
+                }
+            }
+        }
+
+        // ============================================================================
+        // COLLISION DETECTION
+        // ============================================================================
+        // Simple rectangle collision: bullet (rect) vs target (rect)
+        // Hitting the wrong word out of order causes immediate game over
+        function checkCollisions() {
+            for (let i = gameState.bullets.length - 1; i >= 0; i--) {
+                const bullet = gameState.bullets[i];
+                
+                for (let j = gameState.targets.length - 1; j >= 0; j--) {
+                    const target = gameState.targets[j];
+                    
+                    // Rectangle collision check (bullet.x is center, so adjust for collision)
+                    const bulletLeft = bullet.x - bullet.width / 2;
+                    const bulletRight = bullet.x + bullet.width / 2;
+                    if (bulletLeft < target.x + target.width &&
+                        bulletRight > target.x &&
+                        bullet.y < target.y + target.height &&
+                        bullet.y + bullet.height > target.y) {
+                        
+                        // Remove bullet on any hit
+                        gameState.bullets.splice(i, 1);
+                        
+                        // If this is NOT the current target word, it's an out-of-order hit → game over
+                        if (target.wordIndex !== gameState.currentWordIndex) {
+                            gameState.isGameOver = true;
+                            return;
+                        }
+                        
+                        // Correct word hit: remove target
+                        gameState.targets.splice(j, 1);
+                        
+                        // Advance to next word
+                        gameState.currentWordIndex++;
+                        
+                        // Check if level is complete
+                        const levelWords = LEVELS[gameState.currentLevel];
+                        if (gameState.currentWordIndex >= levelWords.length) {
+                            gameState.isLevelComplete = true;
+                            gameState.levelCompleteTime = Date.now();
+                            
+                            // Check if game is won (all levels complete)
+                            if (gameState.currentLevel + 1 >= LEVELS.length) {
+                                gameState.isGameWon = true;
+                            }
+                        }
+                        
+                        // Update combo
+                        const now = Date.now();
+                        if (now - gameState.lastHitTime < COMBO_TIMEOUT) {
+                            gameState.combo++;
+                        } else {
+                            gameState.combo = 1;
+                        }
+                        gameState.lastHitTime = now;
+                        
+                        // Increase score
+                        gameState.score += 10 * gameState.combo;
+                        
+                        // Create particle burst (more violent reaction)
+                        createParticleBurst(target.x + target.width / 2, target.y + target.height / 2);
+                        
+                        // Screen shake
+                        gameState.screenShake.time = SCREEN_SHAKE_DURATION;
+                        
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ============================================================================
+        // UPDATE LOGIC
+        // ============================================================================
+        function update(dt) {
+            if (gameState.isGameOver || gameState.isGameWon) return;
+
+            // Handle level progression (wait 2 seconds before advancing)
+            if (gameState.isLevelComplete && !gameState.isGameWon) {
+                // Clear all targets and bullets
+                gameState.targets = [];
+                gameState.bullets = [];
+                
+                // Wait 2 seconds before advancing to next level
+                const now = Date.now();
+                if (now - gameState.levelCompleteTime > 2000) {
+                    // Advance to next level
+                    if (gameState.currentLevel + 1 < LEVELS.length) {
+                        gameState.currentLevel++;
+                        gameState.currentWordIndex = 0;
+                        gameState.isLevelComplete = false;
+                        gameState.lastSpawnTime = now;
+                    }
+                }
+                return;
+            }
+
+            gameState.gameTime += dt;
+
+            // Update difficulty (base spawn interval before randomness)
+            gameState.spawnInterval = Math.max(
+                MIN_SPAWN_INTERVAL,
+                INITIAL_SPAWN_INTERVAL - gameState.gameTime * SPAWN_INTERVAL_DECREASE_RATE * 1000
+            );
+            gameState.targetSpeed = TARGET_BASE_SPEED + gameState.gameTime * TARGET_SPEED_INCREASE_RATE;
+
+            // Handle input
+            handleInput(dt);
+
+            // Spawn targets (only current & next words), with randomized timing
+            const now = Date.now();
+            if (now - gameState.lastSpawnTime > gameState.spawnJitterInterval) {
+                spawnTarget();
+                gameState.lastSpawnTime = now;
+
+                // Randomize next spawn delay around the current difficulty-based interval
+                const minFactor = 0.4; // can be much sooner
+                const maxFactor = 2.2; // or quite a bit later
+                const jitterFactor = minFactor + Math.random() * (maxFactor - minFactor);
+                gameState.spawnJitterInterval = gameState.spawnInterval * jitterFactor;
+            }
+
+            // Update bullets (straight up)
+            for (let i = gameState.bullets.length - 1; i >= 0; i--) {
+                const b = gameState.bullets[i];
+                b.y -= BULLET_SPEED * dt;
+                if (b.y + b.height < 0) {
+                    gameState.bullets.splice(i, 1);
+                }
+            }
+
+            // Update targets
+            for (let i = gameState.targets.length - 1; i >= 0; i--) {
+                const target = gameState.targets[i];
+                
+                // Update direction change timer and change direction periodically for erratic movement
+                target.directionChangeTimer -= dt;
+                if (target.directionChangeTimer <= 0) {
+                    // Change horizontal direction with some randomness
+                    target.vx = (Math.random() - 0.5) * TARGET_HORIZONTAL_DRIFT * (1 + Math.random() * 0.6);
+                    target.directionChangeTimer = TARGET_DIRECTION_CHANGE_INTERVAL + (Math.random() - 0.5) * 0.25;
+                }
+
+                // Add stronger jitter to horizontal velocity for even more sporadic movement
+                target.vx += (Math.random() - 0.5) * TARGET_HORIZONTAL_DRIFT * 0.65 * dt;
+                
+                // Update position with exaggerated sway for diagonal variation
+                target.swayTime += dt;
+                const swayOffset = Math.sin(target.swayTime * target.swaySpeed) * target.swayAmp * dt;
+                target.x += (target.vx * dt) + swayOffset;
+                target.y += target.vy * dt;
+                
+                // Update target speed to match current difficulty, with stronger per-target variation
+                const speedJitter = 0.7 + Math.random() * 0.6; // 0.7x–1.3x
+                target.vy = gameState.targetSpeed * speedJitter;
+                
+                // Bounce off screen edges for more erratic movement
+                if (target.x < 0) {
+                    target.x = 0;
+                    target.vx = Math.abs(target.vx) * (0.7 + Math.random() * 0.3); // Bounce with some randomness
+                } else if (target.x + target.width > canvas.width) {
+                    target.x = canvas.width - target.width;
+                    target.vx = -Math.abs(target.vx) * (0.7 + Math.random() * 0.3); // Bounce with some randomness
+                }
+                
+                // Check if target reached bottom - immediate game over if current target word is missed
+                if (target.y > canvas.height) {
+                    gameState.targets.splice(i, 1);
+                    // Immediate game over if current target word reaches bottom
+                    if (target.wordIndex === gameState.currentWordIndex) {
+                        gameState.isGameOver = true;
+                    }
+                }
+            }
+
+            // Update particles
+            for (let i = gameState.particles.length - 1; i >= 0; i--) {
+                const particle = gameState.particles[i];
+                
+                // Movement only for sparks; rings stay centered
+                if (particle.type !== 'ring') {
+                    particle.x += particle.vx * dt;
+                    particle.y += particle.vy * dt;
+                }
+                
+                // Expand ring over time
+                if (particle.type === 'ring') {
+                    const progress = 1 - particle.life / particle.maxLife;
+                    particle.radius = 5 + progress * RING_MAX_RADIUS;
+                }
+                
+                particle.life -= dt * 1000;
+                
+                if (particle.life <= 0) {
+                    gameState.particles.splice(i, 1);
+                }
+            }
+
+            // Update stars
+            for (let star of gameState.stars) {
+                star.y += star.speed * dt;
+                if (star.y > canvas.height) {
+                    star.y = 0;
+                    star.x = Math.random() * canvas.width;
+                }
+            }
+
+            // Update screen shake
+            if (gameState.screenShake.time > 0) {
+                gameState.screenShake.time -= dt * 1000;
+                gameState.screenShake.x = (Math.random() - 0.5) * SCREEN_SHAKE_INTENSITY;
+                gameState.screenShake.y = (Math.random() - 0.5) * SCREEN_SHAKE_INTENSITY;
+            } else {
+                gameState.screenShake.x = 0;
+                gameState.screenShake.y = 0;
+            }
+
+            // Check collisions
+            checkCollisions();
+
+            // Reset combo if too much time passed
+            if (now - gameState.lastHitTime > COMBO_TIMEOUT && gameState.combo > 1) {
+                gameState.combo = 1;
+            }
+        }
+
+        // ============================================================================
+        // RENDERING
+        // ============================================================================
+        function draw() {
+            // Clear canvas
+            ctx.fillStyle = COLOR_BACKGROUND;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Apply screen shake
+            ctx.save();
+            ctx.translate(gameState.screenShake.x, gameState.screenShake.y);
+
+            // Draw stars
+            ctx.fillStyle = COLOR_STAR;
+            for (let star of gameState.stars) {
+                ctx.fillRect(star.x, star.y, 2, 2);
+            }
+
+            // Draw particles (more violent, vibrant colors)
+            for (let particle of gameState.particles) {
+                const alpha = particle.life / particle.maxLife;
+                if (particle.type === 'ring') {
+                    // Brighter, more intense rings
+                    ctx.strokeStyle = `rgba(255, 255, 150, ${alpha})`;
+                    ctx.lineWidth = 3; // thicker for more impact
+                    ctx.beginPath();
+                    ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
+                    ctx.stroke();
+                    // Add inner bright ring
+                    ctx.strokeStyle = `rgba(255, 100, 0, ${alpha * 0.6})`;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(particle.x, particle.y, particle.radius * 0.6, 0, Math.PI * 2);
+                    ctx.stroke();
+                } else {
+                    // More vibrant, explosive particle colors
+                    const brightness = 0.7 + Math.random() * 0.3; // vary brightness
+                    ctx.fillStyle = `rgba(255, ${200 + Math.random() * 55}, ${50 + Math.random() * 50}, ${alpha * brightness})`;
+                    const size = particle.size || 4;
+                    ctx.fillRect(particle.x - size / 2, particle.y - size / 2, size, size);
+                    // Add bright white core for explosion effect
+                    if (alpha > 0.5) {
+                        ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.5})`;
+                        ctx.fillRect(particle.x - size / 3, particle.y - size / 3, size * 0.6, size * 0.6);
+                    }
+                }
+            }
+
+            // Draw targets
+            ctx.font = TARGET_FONT;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            for (let target of gameState.targets) {
+                // Highlight current target word
+                if (target.wordIndex === gameState.currentWordIndex) {
+                    ctx.fillStyle = COLOR_TARGET; // Bright red for current target
+                } else {
+                    ctx.fillStyle = "rgba(255, 107, 107, 0.5)"; // Dimmed for other targets
+                }
+                ctx.fillRect(target.x, target.y, target.width, target.height);
+                ctx.fillStyle = COLOR_HUD;
+                ctx.fillText(target.text, target.x + target.width / 2, target.y + target.height / 2);
+            }
+
+            // Draw bullets
+            ctx.fillStyle = COLOR_BULLET;
+            for (let bullet of gameState.bullets) {
+                ctx.fillRect(bullet.x - bullet.width / 2, bullet.y, bullet.width, bullet.height);
+            }
+
+            // Draw player (triangle) at horizontal position
+            ctx.fillStyle = COLOR_PLAYER;
+            ctx.beginPath();
+            ctx.moveTo(gameState.player.x, gameState.player.y - PLAYER_HEIGHT / 2);
+            ctx.lineTo(gameState.player.x - PLAYER_WIDTH / 2, gameState.player.y + PLAYER_HEIGHT / 2);
+            ctx.lineTo(gameState.player.x + PLAYER_WIDTH / 2, gameState.player.y + PLAYER_HEIGHT / 2);
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.restore(); // End screen shake transform
+
+            // Draw HUD (not affected by screen shake)
+            ctx.fillStyle = COLOR_HUD;
+            ctx.font = HUD_FONT;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillText(`Level: ${gameState.currentLevel + 1}/${LEVELS.length}`, 10, 10);
+            ctx.fillText(`Score: ${gameState.score}`, 10, 35);
+            ctx.fillText(`Lives: ${gameState.lives}`, 10, 60);
+            if (gameState.combo > 1) {
+                ctx.fillText(`Combo: x${gameState.combo}`, 10, 85);
+            }
+            
+            // Show current target word
+            if (!gameState.isLevelComplete && !gameState.isGameWon) {
+                const levelWords = LEVELS[gameState.currentLevel];
+                if (levelWords && gameState.currentWordIndex < levelWords.length) {
+                    const currentWord = levelWords[gameState.currentWordIndex];
+                    const progress = `${gameState.currentWordIndex + 1}/${levelWords.length}`;
+                    ctx.fillText(`Target: "${currentWord}" (${progress})`, 10, 110);
+                }
+            }
+
+            // Draw instructions
+            ctx.font = INSTRUCTION_FONT;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText("A/D or Arrow Keys: Move | Space or Click: Shoot | 1: Level 1 | 2: Level 2 | Hit words in order!", canvas.width / 2, canvas.height - 10);
+
+            // Draw level complete overlay
+            if (gameState.isLevelComplete && !gameState.isGameWon) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.fillStyle = COLOR_HUD;
+                ctx.font = GAME_OVER_FONT;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('LEVEL COMPLETE!', canvas.width / 2, canvas.height / 2 - 40);
+                
+                ctx.font = HUD_FONT;
+                if (gameState.currentLevel + 1 < LEVELS.length) {
+                    ctx.fillText(`Starting Level ${gameState.currentLevel + 2}...`, canvas.width / 2, canvas.height / 2 + 20);
+                }
+            }
+
+            // Draw game win overlay
+            if (gameState.isGameWon) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.fillStyle = COLOR_HUD;
+                ctx.font = GAME_OVER_FONT;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('YOU WIN!', canvas.width / 2, canvas.height / 2 - 40);
+                
+                ctx.font = HUD_FONT;
+                ctx.fillText(`Final Score: ${gameState.score}`, canvas.width / 2, canvas.height / 2 + 20);
+                ctx.fillText('Press Space to Restart', canvas.width / 2, canvas.height / 2 + 50);
+            }
+
+            // Draw game over overlay
+            if (gameState.isGameOver) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.fillStyle = COLOR_HUD;
+                ctx.font = GAME_OVER_FONT;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 40);
+                
+                ctx.font = HUD_FONT;
+                ctx.fillText(`Final Score: ${gameState.score}`, canvas.width / 2, canvas.height / 2 + 20);
+                ctx.fillText('Press Space to Restart', canvas.width / 2, canvas.height / 2 + 50);
+            }
+        }
+
+        // ============================================================================
+        // GAME LOOP
+        // ============================================================================
+        let lastTime = null;
+        function gameLoop(currentTime) {
+            if (lastTime === null) {
+                lastTime = currentTime;
+            }
+            const dt = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+            
+            // Cap delta time to prevent large jumps (e.g., tab switching)
+            const clampedDt = Math.min(dt, 0.1);
+            
+            update(clampedDt);
+            draw();
+            
+            requestAnimationFrame(gameLoop);
+        }
+
+        // ============================================================================
+        // EVENT LISTENERS
+        // ============================================================================
+        window.addEventListener('resize', resizeCanvas);
+        
+        window.addEventListener('keydown', (e) => {
+            gameState.keys[e.key] = true;
+            if ((gameState.isGameOver || gameState.isGameWon) && e.key === ' ') {
+                resetGame();
+            }
+        });
+        
+        window.addEventListener('keyup', (e) => {
+            gameState.keys[e.key] = false;
+        });
+
+        canvas.addEventListener('mousedown', () => {
+            gameState.mouseDown = true;
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            gameState.mouseDown = false;
+        });
+
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            gameState.mouseDown = true;
+        });
+
+        canvas.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            gameState.mouseDown = false;
+        });
+
+        // Prevent context menu on right click
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+        });
+
+        // ============================================================================
+        // START GAME
+        // ============================================================================
+        resizeCanvas();
+        resetGame(0); // start on Level 1 by default
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
